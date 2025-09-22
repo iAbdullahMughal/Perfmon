@@ -29,6 +29,9 @@ INSTAGRAM_USERNAME=your_username
 INSTAGRAM_PASSWORD=your_password
 INSTAGRAM_COMMENT=Nice photo!
 INSTAGRAM_PROFILE_URL=https://www.instagram.com/your_username/
+# Optional overrides:
+# CHROME_USER_DATA_DIR=/path/to/persistent/profile
+# CHROME_HEADLESS=false
 ```
 
 ### Running the automation
@@ -38,6 +41,9 @@ python instagram_comment.py            # Uses ./.env by default
 python instagram_comment.py custom.env  # Explicit env file path
 ```
 
-The script launches a headless Chrome browser, signs into Instagram, navigates
-to the supplied profile, opens the first post, and submits the configured
-comment.
+By default the script launches Chrome headlessly while storing session data in
+`./.selenium-profile` so that the login can persist across runs. You can change
+this directory (or disable persistence entirely) via `CHROME_USER_DATA_DIR` and
+toggle headless mode with `CHROME_HEADLESS`. During execution the script signs
+into Instagram if needed, navigates to the supplied profile, opens the first
+available post, and submits the configured comment.
