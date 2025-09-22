@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Dict
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    TimeoutException,
+    StaleElementReferenceException,
+    WebDriverException,
+)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -23,6 +27,8 @@ ENV_USERNAME_KEY = "INSTAGRAM_USERNAME"
 ENV_PASSWORD_KEY = "INSTAGRAM_PASSWORD"
 ENV_COMMENT_KEY = "INSTAGRAM_COMMENT"
 ENV_PROFILE_KEY = "INSTAGRAM_PROFILE_URL"
+ENV_CHROME_PROFILE_DIR = "CHROME_USER_DATA_DIR"
+ENV_CHROME_HEADLESS = "CHROME_HEADLESS"
 
 
 class EnvConfigError(RuntimeError):
@@ -85,28 +91,73 @@ def get_required(values: Dict[str, str], key: str) -> str:
     return value
 
 
-def build_driver() -> webdriver.Chrome:
-    """Configure and return a headless Chrome WebDriver instance."""
+def get_optional(values: Dict[str, str], key: str) -> str | None:
+    """Return an optional environment variable value or ``None`` when missing."""
+
+    value = values.get(key)
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return stripped
+
+
+def str_to_bool(value: str | None, *, default: bool = True) -> bool:
+    """Return the boolean interpretation of ``value``."""
+
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def build_driver(
+    user_data_dir: Path | None = None,
+    *,
+    headless: bool = True,
+) -> webdriver.Chrome:
+    """Configure and return a Chrome WebDriver instance."""
 
     options = Options()
-    options.add_argument("--headless=new")
+    if headless:
+        options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    if user_data_dir is not None:
+        options.add_argument(f"--user-data-dir={user_data_dir}")
     return webdriver.Chrome(options=options)
 
 
 def login(driver: webdriver.Chrome, username: str, password: str) -> None:
     """Log into Instagram with the provided credentials."""
 
-    driver.get("https://www.instagram.com/accounts/login/")
+    login_url = "https://www.instagram.com/accounts/login/"
+    driver.get(login_url)
     wait = WebDriverWait(driver, 20)
 
-    username_field = wait.until(
-        EC.presence_of_element_located((By.NAME, "username"))
-    )
-    password_field = wait.until(
-        EC.presence_of_element_located((By.NAME, "password"))
-    )
+    def _login_page_loaded(driver: webdriver.Chrome) -> bool:
+        return (
+            "accounts/login" not in driver.current_url
+            or driver.find_elements(By.NAME, "username")
+        )
+
+    wait.until(_login_page_loaded)
+
+    if "accounts/login" not in driver.current_url:
+        wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//a[contains(@href, '/explore/')]")
+            )
+        )
+        return
+
+    username_field = driver.find_element(By.NAME, "username")
+    password_field = driver.find_element(By.NAME, "password")
 
     username_field.clear()
     username_field.send_keys(username)
@@ -125,12 +176,39 @@ def navigate_to_first_post(driver: webdriver.Chrome, profile_url: str) -> None:
     driver.get(profile_url)
     wait = WebDriverWait(driver, 20)
 
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "article")))
-    post_links = driver.find_elements(By.CSS_SELECTOR, "article a[href*='/p/']")
-    if not post_links:
-        raise RuntimeError("Could not locate any posts on the profile page")
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "main")))
+    click_wait = WebDriverWait(driver, 5)
 
-    post_links[0].click()
+    post_selectors = [
+        "article a[href*='/p/']",
+        "main section a[href*='/p/']",
+        "main div[role='presentation'] a[href*='/p/']",
+    ]
+
+    for _ in range(10):
+        for selector in post_selectors:
+            post_links = driver.find_elements(By.CSS_SELECTOR, selector)
+            if post_links:
+                first_post = post_links[0]
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", first_post
+                )
+                try:
+                    click_wait.until(
+                        lambda d, element=first_post: all(
+                            (element.is_displayed(), element.is_enabled())
+                        )
+                    )
+                    first_post.click()
+                    return
+                except (StaleElementReferenceException, TimeoutException):
+                    continue
+                except WebDriverException:
+                    continue
+        driver.execute_script("window.scrollBy(0, 400)")
+        time.sleep(0.5)
+
+    raise RuntimeError("Could not locate any posts on the profile page")
 
 
 def leave_comment(driver: webdriver.Chrome, comment: str) -> None:
@@ -155,17 +233,29 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     env_path = Path(argv[0]) if argv else Path(".env")
 
+    user_data_dir: Path | None = None
     try:
         env_values = load_env(env_path)
         username = get_required(env_values, ENV_USERNAME_KEY)
         password = get_required(env_values, ENV_PASSWORD_KEY)
         comment = get_required(env_values, ENV_COMMENT_KEY)
         profile_url = get_required(env_values, ENV_PROFILE_KEY)
+        headless = str_to_bool(get_optional(env_values, ENV_CHROME_HEADLESS), default=True)
+        profile_dir_value = get_optional(env_values, ENV_CHROME_PROFILE_DIR)
+        if profile_dir_value and profile_dir_value.strip().lower() in {
+            "none",
+            "disable",
+            "disabled",
+        }:
+            user_data_dir = None
+        else:
+            user_data_dir = Path(profile_dir_value or ".selenium-profile").expanduser()
+            user_data_dir.mkdir(parents=True, exist_ok=True)
     except (FileNotFoundError, EnvConfigError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    driver = build_driver()
+    driver = build_driver(user_data_dir=user_data_dir, headless=headless)
     try:
         login(driver, username, password)
         navigate_to_first_post(driver, profile_url)
